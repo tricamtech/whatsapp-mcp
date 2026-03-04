@@ -31,6 +31,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Package-level webhook URL for forwarding incoming messages
+var webhookURL string
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -467,7 +470,50 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Forward to webhook if configured (non-blocking)
+		if webhookURL != "" && !msg.Info.IsFromMe && content != "" {
+			go func() {
+				// Try to resolve sender phone number from JID
+				senderPhone := msg.Info.Sender.User
+				// For LID-type JIDs, try to get the phone number from chat JID
+				// or fall back to sender user part
+				chatPhone := msg.Info.Chat.User
+
+				payload := map[string]interface{}{
+					"sender_jid":   msg.Info.Sender.String(),
+					"chat_jid":     chatJID,
+					"message_id":   msg.Info.ID,
+					"text":         content,
+					"timestamp":    msg.Info.Timestamp.Unix(),
+					"sender_name":  name,
+					"sender_phone": senderPhone,
+					"chat_phone":   chatPhone,
+				}
+				jsonData, err := json.Marshal(payload)
+				if err != nil {
+					logger.Warnf("Failed to marshal webhook payload: %v", err)
+					return
+				}
+				logger.Infof("Webhook POST to %s: sender=%s chat=%s", webhookURL, msg.Info.Sender.String(), chatJID)
+				resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonData))
+				if err != nil {
+					logger.Warnf("Webhook POST failed: %v", err)
+					return
+				}
+				resp.Body.Close()
+				logger.Infof("Webhook POST success: %d", resp.StatusCode)
+			}()
+		}
 	}
+}
+
+// ReactRequest represents the request body for the react API
+type ReactRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	SenderJID string `json:"sender_jid"`
+	Emoji     string `json:"emoji"`
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -641,7 +687,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -723,6 +769,55 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for reacting to messages
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ReactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" || req.MessageID == "" || req.Emoji == "" {
+			http.Error(w, "chat_jid, message_id, and emoji are required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid chat_jid: %v", err)})
+			return
+		}
+
+		senderJID := chatJID
+		if req.SenderJID != "" {
+			senderJID, err = types.ParseJID(req.SenderJID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid sender_jid: %v", err)})
+				return
+			}
+		}
+
+		reactionMsg := client.BuildReaction(chatJID, senderJID, req.MessageID, req.Emoji)
+		_, err = client.SendMessage(context.Background(), chatJID, reactionMsg)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Failed to send reaction: %v", err)})
+		} else {
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reaction sent"})
+		}
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -789,6 +884,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
+
+	// Read webhook URL from environment
+	webhookURL = os.Getenv("WEBHOOK_URL")
+	if webhookURL != "" {
+		logger.Infof("Webhook URL configured: %s", webhookURL)
+	}
+
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
@@ -800,14 +902,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1075,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1090,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
